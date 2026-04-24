@@ -1,0 +1,12 @@
+# Always check out shell scripts with LF line endings, regardless of host OS.
+# Prevents Windows CRLF from sneaking into files that will run on Linux.
+*.sh text eol=lf
+
+# Apply the same rule to other files that will be consumed by Linux tools.
+*.py text eol=lf
+Dockerfile text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# Markdown can go either way; let git auto-handle based on content.
+*.md text
