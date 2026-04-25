@@ -44,6 +44,10 @@ log() { echo -e "\n\033[1;36m[install] $*\033[0m"; }
 # (or non-interactive runs) fall through to the soft-skip in Section 6.
 prompt_hf_token_if_unset() {
   if [[ -n "${HF_TOKEN:-}" ]]; then return 0; fi
+  if [[ -f "$MODELS_DIR/hf-gated/seamless-expressive/pretssel_melhifigan_wm-final.pt" ]]; then
+    log "SeamlessExpressive already on volume — skipping HF_TOKEN prompt."
+    return 0
+  fi
   if [[ ! -t 0 ]]; then
     log "HF_TOKEN unset and stdin is not a tty — gated downloads will be skipped."
     return 0
