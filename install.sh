@@ -25,6 +25,8 @@
 #   models/hf-cache/                    HF CLI config (token, etc.) — small
 #   models/hf-gated/seamless-expressive/ SeamlessExpressive weights (~22 GB)
 #   models/checkpoints-demo/            Gradio demo CHECKPOINTS_PATH target
+#   npm-global/                         volume-backed npm prefix — Claude Code CLI
+#   .claude/                            Claude Code CLI config (CLAUDE_CONFIG_DIR)
 #   .scripts/                           this repo (for redeploy reproducibility)
 #   install.sh, start.sh                convenience copies of the scripts
 
@@ -51,26 +53,51 @@ create_dirs() {
 }
 
 # ---------------------------------------------------------------------------
-# Section 1: System apt deps (container overlay — re-runs each fresh pod)
+# Section 1: System apt deps + node20 + Claude Code CLI (container overlay —
+# re-runs each fresh pod). Also drops /etc/profile.d/seamless.sh so SSH
+# sessions inherit the volume-backed npm prefix + CLAUDE_CONFIG_DIR without
+# sourcing start.sh.
 # ---------------------------------------------------------------------------
 install_apt_deps() {
-  log "Section 1: apt deps"
-  if command -v ffmpeg >/dev/null \
-     && command -v node >/dev/null \
-     && command -v git-lfs >/dev/null \
-     && ldconfig -p | grep -q libsndfile.so.1; then
+  log "Section 1: apt deps + node + claude CLI"
+
+  if ! { command -v ffmpeg >/dev/null \
+        && command -v git-lfs >/dev/null \
+        && ldconfig -p | grep -q libsndfile.so.1; }; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-install-recommends \
+      libsndfile1 ffmpeg git-lfs build-essential python3-venv curl ca-certificates
+    git lfs install
+  else
     log "apt deps already present, skipping"
-    return 0
   fi
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update
-  apt-get install -y --no-install-recommends \
-    libsndfile1 ffmpeg git-lfs build-essential python3-venv curl ca-certificates
+
   if ! command -v node >/dev/null || [[ "$(node --version)" != v20.* ]]; then
     curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
     apt-get install -y nodejs
   fi
-  git lfs install
+
+  # /etc/profile.d/seamless.sh — sourced by login shells (SSH) so `claude`
+  # resolves and reads its config from the volume even outside start.sh.
+  cat > /etc/profile.d/seamless.sh <<'EOF'
+# Seamless PoC — volume-backed paths for npm + claude
+export NPM_CONFIG_PREFIX=/workspace/npm-global
+export PATH=$NPM_CONFIG_PREFIX/bin:$PATH
+export CLAUDE_CONFIG_DIR=/workspace/.claude
+EOF
+  chmod 0644 /etc/profile.d/seamless.sh
+
+  # Claude Code CLI under the volume-backed npm prefix so it survives pod
+  # redeploys. Re-installs (npm-global is wiped) are a no-op once present.
+  export NPM_CONFIG_PREFIX=$WORKSPACE/npm-global
+  export PATH=$NPM_CONFIG_PREFIX/bin:$PATH
+  mkdir -p "$NPM_CONFIG_PREFIX"
+  if ! command -v claude >/dev/null; then
+    npm install -g @anthropic-ai/claude-code
+  else
+    log "claude CLI already present, skipping"
+  fi
 }
 
 # ---------------------------------------------------------------------------

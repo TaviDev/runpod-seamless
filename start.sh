@@ -7,6 +7,7 @@
 #   ./start.sh expressive <audio.wav> --tgt_lang <lang> [...]
 #   ./start.sh try <audio.wav> [tgt_lang]    M4T S2TT + M4T S2ST + expressive S2ST, side-by-side
 #   ./start.sh streaming                 streaming server (TODO — see test-streaming for smoke test)
+#   ./start.sh claude                    Claude Code CLI with volume-backed config
 #   ./start.sh test-m4t                  smoke-test M4T v2 against reference WAV
 #   ./start.sh test-expressive           smoke-test SeamlessExpressive against reference WAV
 #   ./start.sh test-streaming            smoke-test streaming stack (import + asset resolution)
@@ -33,6 +34,13 @@ mkdir -p "$FAIRSEQ2_CACHE_DIR"
 # SeamlessExpressive is HF-gated and NOT fetched by fairseq2 — it's
 # downloaded manually via `hf download` and passed via --gated-model-dir.
 EXPRESSIVE_MODEL_DIR=$WORKSPACE/models/hf-gated/seamless-expressive
+
+# Volume-backed Claude Code config + npm global prefix. /etc/profile.d/seamless.sh
+# (dropped by install.sh) sets these for SSH sessions; we re-export here so
+# `start.sh claude` works even from a bare-bash invocation.
+export NPM_CONFIG_PREFIX=$WORKSPACE/npm-global
+export PATH=$NPM_CONFIG_PREFIX/bin:$PATH
+export CLAUDE_CONFIG_DIR=$WORKSPACE/.claude
 
 # Reference audio used by test modes. English source:
 # "Do you want to resume the first, second or third timer?"
@@ -182,6 +190,14 @@ case "$MODE" in
     echo "(for a stack smoke test, try: $0 test-streaming)"
     exit 1
     ;;
+  claude)
+    if ! command -v claude >/dev/null; then
+      echo "ERROR: claude CLI not found at $NPM_CONFIG_PREFIX/bin/claude"
+      echo "Re-run /workspace/install.sh (Section 1 installs it)."
+      exit 1
+    fi
+    exec claude "$@"
+    ;;
   test-m4t)
     run_test_m4t
     ;;
@@ -220,7 +236,7 @@ case "$MODE" in
     exec python "$@"
     ;;
   *)
-    echo "Usage: $0 {m4t|expressive|try|streaming|test-m4t|test-expressive|test-streaming|test-all|shell|python} [args...]"
+    echo "Usage: $0 {m4t|expressive|try|streaming|claude|test-m4t|test-expressive|test-streaming|test-all|shell|python} [args...]"
     exit 1
     ;;
 esac
