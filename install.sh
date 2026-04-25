@@ -12,11 +12,19 @@
 # Idempotent: safe to re-run on a partially-set-up volume. Each section has
 # a guard that skips the work if it's already been done.
 #
+# Env vars consumed:
+#   HF_TOKEN   (optional) HuggingFace token for gated SeamlessExpressive
+#              download. Set on the RunPod private template. If unset,
+#              install completes but `start.sh expressive` will be unusable
+#              until the model is downloaded manually.
+#
 # What ends up on the volume (~/workspace):
 #   envs/seamless/                      Python venv (~14 GB)
 #   seamless_communication/             cloned repo, installed as -e . (~200 MB)
 #   models/fairseq2-cache/              populated lazily by fairseq2 on first inference
 #   models/hf-cache/                    HF CLI config (token, etc.) — small
+#   models/hf-gated/seamless-expressive/ SeamlessExpressive weights (~22 GB)
+#   models/checkpoints-demo/            Gradio demo CHECKPOINTS_PATH target
 #   .scripts/                           this repo (for redeploy reproducibility)
 #   install.sh, start.sh                convenience copies of the scripts
 
@@ -38,6 +46,8 @@ create_dirs() {
   mkdir -p "$WORKSPACE/envs"
   mkdir -p "$MODELS_DIR/fairseq2-cache"
   mkdir -p "$MODELS_DIR/hf-cache"
+  mkdir -p "$MODELS_DIR/hf-gated/seamless-expressive"
+  mkdir -p "$MODELS_DIR/checkpoints-demo"
 }
 
 # ---------------------------------------------------------------------------
@@ -131,7 +141,8 @@ install_seamless() {
   pip install --no-deps -e .
   pip install \
     "datasets==2.18.0" "fire" "librosa" "openai-whisper" "simuleval~=1.1.3" \
-    "sonar-space==0.2.*" "soundfile" "scipy" "tqdm" "numpy<2" "wheel<0.45"
+    "sonar-space==0.2.*" "soundfile" "scipy" "tqdm" "numpy<2" "wheel<0.45" \
+    "huggingface_hub>=0.20" "gradio~=4.5.0" "gradio_client"
   python -c "
 import torch
 from fairseq2.data.audio import AudioDecoder
@@ -143,14 +154,58 @@ print('Section 4 check passed')
 }
 
 # ---------------------------------------------------------------------------
-# Section 5: Publish the scripts to convenient paths on the volume.
+# Section 6: HF auth + SeamlessExpressive (gated) download.
+# fairseq2 lazily pulls non-gated models on first inference, but
+# SeamlessExpressive is HF-gated and must be fetched via `hf download`. We
+# bootstrap the HF token from the HF_TOKEN env var (set on the RunPod
+# private template) so cold-volume rebuilds finish without manual steps.
+# Soft-skip if HF_TOKEN is unset — install still completes, M4T flows work.
+# ---------------------------------------------------------------------------
+download_gated_models() {
+  log "Section 6: HF auth + SeamlessExpressive"
+  # shellcheck disable=SC1091
+  source "$VENV_DIR/bin/activate"
+  export HF_HOME="$MODELS_DIR/hf-cache"
+  export HUGGINGFACE_HUB_CACHE="$HF_HOME/hub"
+
+  if [[ -z "${HF_TOKEN:-}" ]]; then
+    log "HF_TOKEN not set — skipping gated downloads."
+    log "  Set HF_TOKEN in your RunPod template env vars and re-run install.sh,"
+    log "  or download manually:"
+    log "    hf download facebook/seamless-expressive --repo-type model \\"
+    log "      --local-dir $MODELS_DIR/hf-gated/seamless-expressive"
+    return 0
+  fi
+
+  hf auth login --token "$HF_TOKEN" --add-to-git-credential
+
+  EXPR_DIR=$MODELS_DIR/hf-gated/seamless-expressive
+  # Sentinel: pretssel_melhifigan_wm-final.pt is the unique 24kHz vocoder
+  # checkpoint shipped in the release. Adjust if Meta renames upstream.
+  if [[ ! -f "$EXPR_DIR/pretssel_melhifigan_wm-final.pt" ]]; then
+    log "downloading SeamlessExpressive (~22 GB) -> $EXPR_DIR"
+    hf download facebook/seamless-expressive --repo-type model --local-dir "$EXPR_DIR"
+  else
+    log "SeamlessExpressive already present, skipping"
+  fi
+
+  # The 24kHz vocoder card hardcodes the basename pretssel_melhifigan_wm.pt
+  # but the release ships it as pretssel_melhifigan_wm-final.pt.
+  if [[ ! -e "$EXPR_DIR/pretssel_melhifigan_wm.pt" \
+        && -f "$EXPR_DIR/pretssel_melhifigan_wm-final.pt" ]]; then
+    ln -sf pretssel_melhifigan_wm-final.pt "$EXPR_DIR/pretssel_melhifigan_wm.pt"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Section 7: Publish the scripts to convenient paths on the volume.
 # The git clone landed them under $WORKSPACE/.scripts/ — copy install.sh and
 # start.sh to $WORKSPACE/ too, so the usage line in the welcome message works.
-# Models are NOT downloaded here; fairseq2 pulls them on first inference and
-# caches to $FAIRSEQ2_CACHE_DIR (set by start.sh).
+# Non-gated models are NOT downloaded here; fairseq2 pulls them on first
+# inference and caches to $FAIRSEQ2_CACHE_DIR (set by start.sh).
 # ---------------------------------------------------------------------------
 publish_scripts() {
-  log "Section 5: copy scripts to /workspace/ for convenience"
+  log "Section 7: copy scripts to /workspace/ for convenience"
   cp "$SCRIPT_DIR/install.sh" "$WORKSPACE/install.sh"
   cp "$SCRIPT_DIR/start.sh"   "$WORKSPACE/start.sh"
   chmod +x "$WORKSPACE/install.sh" "$WORKSPACE/start.sh"
@@ -162,6 +217,7 @@ main() {
   clone_repo
   install_python_stack
   install_seamless
+  download_gated_models
   publish_scripts
 
   log "Install complete."
