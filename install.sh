@@ -40,6 +40,31 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
 log() { echo -e "\n\033[1;36m[install] $*\033[0m"; }
 
+# Prompt for HF_TOKEN up-front if unset and stdin is a tty. Empty input
+# (or non-interactive runs) fall through to the soft-skip in Section 6.
+prompt_hf_token_if_unset() {
+  if [[ -n "${HF_TOKEN:-}" ]]; then return 0; fi
+  if [[ ! -t 0 ]]; then
+    log "HF_TOKEN unset and stdin is not a tty — gated downloads will be skipped."
+    return 0
+  fi
+  echo
+  echo "HF_TOKEN is not set. SeamlessExpressive (~22 GB) is HF-gated and"
+  echo "won't be auto-downloaded without a token. Get one at:"
+  echo "  https://huggingface.co/settings/tokens   (read access is enough)"
+  echo "and accept the model terms at:"
+  echo "  https://huggingface.co/facebook/seamless-expressive"
+  echo
+  read -r -s -p "Paste HF_TOKEN now (or press Enter to skip): " HF_TOKEN
+  echo
+  if [[ -n "$HF_TOKEN" ]]; then
+    export HF_TOKEN
+    log "HF_TOKEN captured for this run."
+  else
+    log "No token given — gated downloads will be deferred."
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # Section 0: Directory skeleton on the volume
 # ---------------------------------------------------------------------------
@@ -239,6 +264,7 @@ publish_scripts() {
 }
 
 main() {
+  prompt_hf_token_if_unset
   create_dirs
   install_apt_deps
   clone_repo
