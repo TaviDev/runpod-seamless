@@ -47,12 +47,27 @@ Pre-reqs:
 - Container disk ≥ 40 GB; network volume mounted at `/workspace`.
 - Pod template: `runpod/pytorch:2.2.0-py3.10-cuda12.1.1-devel-ubuntu22.04`.
 
+**Direct path** (run install.sh in your terminal, watch the logs yourself):
+
 ```bash
 cd /workspace
 git clone https://github.com/TaviDev/runpod-seamless.git .scripts
 bash .scripts/install.sh         # ~25–35 min cold; ~22 GB gated weights + venv + React build
 /workspace/start.sh test-all     # smoke: m4t + expressive + streaming model-load
 ```
+
+**With claude-code driving** (claude runs install.sh and reports back):
+
+```bash
+cd /workspace
+git clone https://github.com/TaviDev/runpod-seamless.git .scripts
+bash .scripts/bootstrap-claude.sh   # installs node 20 + claude-code, then exec's claude
+# in claude:  "run bash /workspace/.scripts/install.sh, then /workspace/start.sh test-all"
+```
+
+`bootstrap-claude.sh` is idempotent — re-runs short-circuit on each step
+that's already done. Both `node` and the `claude` CLI live under the
+volume-backed `/workspace/npm-global/`, so they survive pod stop/start.
 
 `install.sh` is idempotent: every section has a guard, so re-runs after a
 partial install pick up where they left off. `HF_TOKEN` is read from the env
