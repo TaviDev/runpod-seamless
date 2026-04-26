@@ -39,6 +39,38 @@ Everything that needs to persist lives here (venv, repo, model cache). Sizing de
 | **Subtotal (streaming, 1 source lang)** | **~50 GB** | M4T + streaming + 1 SONAR encoder |
 | **Subtotal (streaming, all langs)** | **~110 GB** | M4T + streaming + 7 SONAR encoders |
 
+## Cold pod bringup
+
+Pre-reqs:
+- `HF_TOKEN` set in the pod template env (read access; accept the model
+  terms at <https://huggingface.co/facebook/seamless-expressive> first).
+- Container disk ≥ 40 GB; network volume mounted at `/workspace`.
+- Pod template: `runpod/pytorch:2.2.0-py3.10-cuda12.1.1-devel-ubuntu22.04`.
+
+```bash
+cd /workspace
+git clone https://github.com/TaviDev/runpod-seamless.git .scripts
+bash .scripts/install.sh         # ~25–35 min cold; ~22 GB gated weights + venv + React build
+/workspace/start.sh test-all     # smoke: m4t + expressive + streaming model-load
+```
+
+`install.sh` is idempotent: every section has a guard, so re-runs after a
+partial install pick up where they left off. `HF_TOKEN` is read from the env
+on first install; thereafter `hf auth login` writes it to
+`/workspace/models/hf-cache/token`, which persists on the volume across pod
+stop/start. Subsequent installs/redeploys don't need the env var.
+
+Add `7860` and `7862` as **HTTP Ports** in the pod UI (Edit Pod → HTTP
+Ports) so the demos are reachable through the RunPod HTTPS proxy at
+`https://${RUNPOD_POD_ID}-${PORT}.proxy.runpod.net/`.
+
+Demo commands (after `test-all` passes):
+
+```bash
+/workspace/start.sh demo-offline both        # M4T :7860 + Expressive :7862, side by side
+/workspace/start.sh demo-streaming           # streaming on :7860 — stop demo-offline m4t first
+```
+
 ## Demos
 
 Two browser-accessible demos, both via RunPod's HTTPS proxy. Add the listed
@@ -86,20 +118,12 @@ Notes:
 
 ### First-time setup
 
-`demo-offline` and `demo-streaming` both call `ensure_demo_deps` on first run,
-which installs `gradio~=4.5.0` plus an HTTP stack pinned to the gradio
-4.5.0-era window (`starlette<0.40`, `fastapi<0.110`, `uvicorn<0.35`). The
-gradio pin matches upstream's demo `requirements.txt`; the HTTP-stack pins
-are needed because pip's resolver otherwise pulls in `starlette` ≥ 1.0,
-which breaks gradio's template render with `TypeError: unhashable type:
-'dict'`.
+`install.sh` handles everything both demos need — Section 4 installs gradio
++ a pinned HTTP stack (`starlette<0.40`, `fastapi<0.110`, `uvicorn<0.35`),
+and Section 5 clones the streaming HF Space and builds the React frontend.
 
-Streaming additionally needs the cloned Space repo at
-`/workspace/seamless-streaming-demo/` and a built React `dist/`. One-time:
-
-```
-git clone https://huggingface.co/spaces/facebook/seamless-streaming \
-  /workspace/seamless-streaming-demo
-cd /workspace/seamless-streaming-demo/streaming-react-app
-yarn install && yarn build
-```
+The HTTP-stack pins are required: pip's resolver otherwise pulls
+`starlette` ≥ 1.0, which breaks gradio 4.5's template render with
+`TypeError: unhashable type: 'dict'`. `start.sh`'s `ensure_demo_deps`
+helper is a runtime fallback for volumes that predate this install path —
+on a fresh `install.sh` run, it's a no-op.
