@@ -21,11 +21,13 @@
 # What ends up on the volume (~/workspace):
 #   envs/seamless/                      Python venv (~14 GB)
 #   seamless_communication/             cloned repo, installed as -e . (~200 MB)
+#   seamless-streaming-demo/            cloned HF Space + built React dist/ (~500 MB)
 #   models/fairseq2-cache/              populated lazily by fairseq2 on first inference
 #   models/hf-cache/                    HF CLI config (token, etc.) — small
 #   models/hf-gated/seamless-expressive/ SeamlessExpressive weights (~22 GB)
 #   models/checkpoints-demo/            Gradio demo CHECKPOINTS_PATH target
-#   npm-global/                         volume-backed npm prefix — Claude Code CLI
+#   models/.demo-deps-installed-v2      sentinel: demo HTTP stack pinned correctly
+#   npm-global/                         volume-backed npm prefix — Claude Code CLI + yarn
 #   .claude/                            Claude Code CLI config (CLAUDE_CONFIG_DIR)
 #   .scripts/                           this repo (for redeploy reproducibility)
 #   install.sh, start.sh                convenience copies of the scripts
@@ -114,6 +116,10 @@ install_apt_deps() {
     apt-get install -y nodejs
   fi
 
+  # yarn — needed by Section 5 to build the streaming-react-app frontend.
+  # Lives under the volume-backed NPM_CONFIG_PREFIX (set below), so it
+  # survives container redeploys.
+
   # /etc/profile.d/seamless.sh — sourced by login shells (SSH) so `claude`
   # resolves and reads its config from the volume even outside start.sh.
   cat > /etc/profile.d/seamless.sh <<'EOF'
@@ -133,6 +139,12 @@ EOF
     npm install -g @anthropic-ai/claude-code
   else
     log "claude CLI already present, skipping"
+  fi
+
+  if ! command -v yarn >/dev/null; then
+    npm install -g yarn
+  else
+    log "yarn already present, skipping"
   fi
 }
 
@@ -189,15 +201,24 @@ print('Section 3 ABI check passed')
 }
 
 # ---------------------------------------------------------------------------
-# Section 4: seamless_communication + its non-torch/non-fairseq deps.
+# Section 4: seamless_communication + its non-torch/non-fairseq deps + the
+# offline-Gradio HTTP stack.
 # --no-deps on seamless itself so pip doesn't re-resolve torch/fairseq2.
+# starlette/fastapi/uvicorn pinned because pip's resolver otherwise pulls
+# starlette 1.0.0, which breaks gradio 4.5's templates.TemplateResponse with
+# `TypeError: unhashable type: 'dict'` in jinja2's LRUCache.
 # ---------------------------------------------------------------------------
+DEMO_DEPS_MARKER=$WORKSPACE/models/.demo-deps-installed-v2
+
 install_seamless() {
   log "Section 4: seamless_communication package + deps"
   # shellcheck disable=SC1091
   source "$VENV_DIR/bin/activate"
-  if python -c "from seamless_communication.inference import Translator" 2>/dev/null; then
-    log "seamless_communication already importable, skipping"
+  if [[ -f "$DEMO_DEPS_MARKER" ]] && python -c "
+from seamless_communication.inference import Translator
+import gradio, omegaconf, starlette, fastapi, uvicorn
+" 2>/dev/null; then
+    log "seamless_communication + demo deps already installed, skipping"
     return 0
   fi
   cd "$REPO_DIR"
@@ -205,15 +226,82 @@ install_seamless() {
   pip install \
     "datasets==2.18.0" "fire" "librosa" "openai-whisper" "simuleval~=1.1.3" \
     "sonar-space==0.2.*" "soundfile" "scipy" "tqdm" "numpy<2" "wheel<0.45" \
-    "huggingface_hub>=0.20" "gradio~=4.5.0" "gradio_client"
+    "huggingface_hub>=0.20" "gradio~=4.5.0" "gradio_client" "omegaconf~=2.3.0" \
+    "starlette>=0.27,<0.40" "fastapi>=0.104,<0.110" "uvicorn>=0.23,<0.35"
   python -c "
 import torch
 from fairseq2.data.audio import AudioDecoder
 from seamless_communication.inference import Translator
+import gradio, omegaconf, starlette, fastapi, uvicorn
 assert torch.__version__.startswith('2.1.1'), f'torch drift: {torch.__version__}'
 assert torch.cuda.is_available()
 print('Section 4 check passed')
 "
+  touch "$DEMO_DEPS_MARKER"
+}
+
+# ---------------------------------------------------------------------------
+# Section 5: Streaming demo bootstrap (HF Space clone + Python deps + React
+# build). Skipped from upstream `requirements.txt`: Flask/Flask_Sockets/gevent/
+# Werkzeug (vestigial — `app_pubsub` is Starlette), numpy==1.24.4 (we keep
+# 1.26.4), whisper==1.1.10 (different package; not what `app_pubsub` imports),
+# openai_whisper==20230124 (we keep 20250625, API-stable).
+# All --no-deps because pip's resolver would otherwise re-pull numpy 2 / a
+# different starlette / etc. and shred Section 3+4. Leaf deps below were
+# discovered empirically by ImportError in Session 5 (python-socketio needs
+# python-engineio+bidict+simple-websocket; python-jose needs ecdsa+pyasn1+rsa;
+# g2p_en needs nltk+inflect+distance; psola needs pypar+praat-parselmouth).
+# ---------------------------------------------------------------------------
+STREAMING_DIR=$WORKSPACE/seamless-streaming-demo
+
+install_streaming_demo() {
+  log "Section 5: streaming demo (HF Space + Python deps + React build)"
+  # shellcheck disable=SC1091
+  source "$VENV_DIR/bin/activate"
+
+  if [[ ! -d "$STREAMING_DIR/.git" ]]; then
+    log "  cloning facebook/seamless-streaming -> $STREAMING_DIR"
+    git clone https://huggingface.co/spaces/facebook/seamless-streaming "$STREAMING_DIR"
+  else
+    log "  HF Space already cloned, skipping"
+  fi
+
+  if python -c "
+import socketio, jose, g2p_en, psola, parselmouth, stable_whisper
+import nltk, inflect, distance, pypar, ecdsa, pyasn1, rsa
+import bidict, engineio, simple_websocket, wsproto
+import silero, parallel_wavegan, colorlog, pydub, hf_transfer
+" 2>/dev/null; then
+    log "  streaming Python deps already present, skipping"
+  else
+    log "  installing streaming Python deps (--no-deps)"
+    pip install --no-deps \
+      "python-socketio==5.9.0" "python-engineio==4.7.1" \
+      "bidict==0.22.1" "simple-websocket==1.0.0" "wsproto==1.2.0" \
+      "python-jose[cryptography]==3.3.0" \
+      "ecdsa==0.18.0" "pyasn1==0.5.0" "rsa==4.9" \
+      "g2p_en==2.1.0" "nltk==3.8.1" "inflect==7.0.0" "distance==0.1.3" \
+      "silero==0.4.1" "parallel-wavegan==0.5.5" "colorlog==6.7.0" "pydub==0.25.1" \
+      "psola==0.0.1" "pypar==0.0.6" "praat-parselmouth==0.4.3" \
+      "stable-ts==1.4.0" "hf_transfer==0.1.4"
+    python -c "
+import socketio, jose, g2p_en, psola, parselmouth, stable_whisper
+print('Section 5 deps check passed')
+"
+  fi
+
+  REACT_DIR=$STREAMING_DIR/streaming-react-app
+  if [[ -d "$REACT_DIR/dist" ]]; then
+    log "  React dist/ already built, skipping"
+  else
+    log "  building React frontend (yarn install + yarn build)"
+    # shellcheck disable=SC2034
+    export NPM_CONFIG_PREFIX=$WORKSPACE/npm-global
+    export PATH=$NPM_CONFIG_PREFIX/bin:$PATH
+    cd "$REACT_DIR"
+    yarn install
+    yarn build
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -287,6 +375,7 @@ main() {
   clone_repo
   install_python_stack
   install_seamless
+  install_streaming_demo
   download_gated_models
   publish_scripts
 
