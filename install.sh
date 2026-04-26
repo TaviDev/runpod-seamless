@@ -44,6 +44,13 @@ log() { echo -e "\n\033[1;36m[install] $*\033[0m"; }
 # (or non-interactive runs) fall through to the soft-skip in Section 6.
 prompt_hf_token_if_unset() {
   if [[ -n "${HF_TOKEN:-}" ]]; then return 0; fi
+  # Token cached on the volume by a prior `hf auth login` survives pod
+  # restarts (HF_HOME lives on /workspace). huggingface_hub reads it
+  # automatically — no env var needed.
+  if [[ -s "$MODELS_DIR/hf-cache/token" ]]; then
+    log "HF token cached on volume ($MODELS_DIR/hf-cache/token) — skipping prompt."
+    return 0
+  fi
   if [[ -f "$MODELS_DIR/hf-gated/seamless-expressive/pretssel_melhifigan_wm-final.pt" ]]; then
     log "SeamlessExpressive already on volume — skipping HF_TOKEN prompt."
     return 0
@@ -224,16 +231,22 @@ download_gated_models() {
   export HF_HOME="$MODELS_DIR/hf-cache"
   export HUGGINGFACE_HUB_CACHE="$HF_HOME/hub"
 
-  if [[ -z "${HF_TOKEN:-}" ]]; then
-    log "HF_TOKEN not set — skipping gated downloads."
+  # Auth precedence: HF_TOKEN env var (fresh credential, e.g. first install or
+  # rotation) → cached token at $HF_HOME/token (volume-persistent, survives
+  # pod stop/start). hf/huggingface_hub auto-read the cached token, so we
+  # only call `hf auth login` when given a new one.
+  if [[ -n "${HF_TOKEN:-}" ]]; then
+    hf auth login --token "$HF_TOKEN" --add-to-git-credential
+  elif [[ -s "$HF_HOME/token" ]] && hf auth whoami >/dev/null 2>&1; then
+    log "using cached HF token at $HF_HOME/token ($(hf auth whoami 2>/dev/null | head -1))"
+  else
+    log "no HF_TOKEN env var and no valid cached token — skipping gated downloads."
     log "  Set HF_TOKEN in your RunPod template env vars and re-run install.sh,"
     log "  or download manually:"
     log "    hf download facebook/seamless-expressive --repo-type model \\"
     log "      --local-dir $MODELS_DIR/hf-gated/seamless-expressive"
     return 0
   fi
-
-  hf auth login --token "$HF_TOKEN" --add-to-git-credential
 
   EXPR_DIR=$MODELS_DIR/hf-gated/seamless-expressive
   # Sentinel: pretssel_melhifigan_wm-final.pt is the unique 24kHz vocoder
