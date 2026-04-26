@@ -12,6 +12,7 @@
 #   ./start.sh test-m4t                  smoke-test M4T v2 against reference WAV
 #   ./start.sh test-expressive           smoke-test SeamlessExpressive against reference WAV
 #   ./start.sh test-streaming            smoke-test streaming stack (import + asset resolution)
+#   ./start.sh test-demo-offline         launch demo-offline both, probe :7860 + :7862, tear down
 #   ./start.sh test-all                  run all three smoke tests, summarize
 #   ./start.sh shell                     bash with env + venv active
 #   ./start.sh python [args...]          python with env + venv active
@@ -20,6 +21,7 @@ set -euo pipefail
 
 WORKSPACE=/workspace
 VENV_DIR=$WORKSPACE/envs/seamless
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
 # HF_HOME keeps the HF auth token on the volume (for gated-model downloads).
 export HF_HOME=$WORKSPACE/models/hf-cache
@@ -152,6 +154,32 @@ print_proxy_url() {
   fi
 }
 
+# SIGTERM (then SIGKILL) every process holding a LISTEN socket on the given
+# TCP ports. test-demo-offline cleanup needs this because launch_offline.sh
+# exec's into `python app.py` — the wrapper path drops out of the proc title,
+# so `pkill -f launch_offline.sh` misses the live python. Tracking the PID
+# from the listening socket is the only reliable handle without a pidfile.
+kill_listeners_on() {
+  local pids=() pid line
+  for port in "$@"; do
+    while read -r pid; do [[ -n "$pid" ]] && pids+=("$pid"); done < <(
+      ss -ltnp 2>/dev/null | awk -v p="$port" '
+        $4 ~ ":"p"$" {
+          line = $0
+          while (match(line, /pid=[0-9]+/)) {
+            print substr(line, RSTART+4, RLENGTH-4)
+            line = substr(line, RSTART+RLENGTH)
+          }
+        }'
+    )
+  done
+  if (( ${#pids[@]} > 0 )); then
+    kill -TERM "${pids[@]}" 2>/dev/null || true
+    sleep 3
+    kill -KILL "${pids[@]}" 2>/dev/null || true
+  fi
+}
+
 run_test_m4t() {
   echo "=== test-m4t: M4T v2 large, S2TT eng->spa ==="
   m4t_predict "$REF_WAV" \
@@ -171,6 +199,61 @@ run_test_expressive() {
     --gated-model-dir "$EXPRESSIVE_MODEL_DIR" \
     --output_path "$TEST_OUT/expressive_eng_spa.wav" || return $?
   echo "Output written to $TEST_OUT/expressive_eng_spa.wav"
+}
+
+run_test_demo_offline() {
+  echo "=== test-demo-offline: launch demo-offline both, probe both ports ==="
+  for p in 7860 7862; do
+    if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "(:|\.)$p\$"; then
+      echo "  ERROR: port $p already bound — stop the existing demo first."
+      return 1
+    fi
+  done
+
+  local log_dir=$TEST_OUT/demo-logs
+  mkdir -p "$log_dir"
+  local log=$log_dir/test-demo-offline.log
+  : > "$log"
+
+  bash "$SCRIPT_DIR/start.sh" demo-offline both > "$log" 2>&1 &
+  local demo_pid=$!
+  # RETURN trap fires whether we exit via PASS, FAIL, or set -e — guarantees
+  # we don't leak the python apps holding 7860/7862.
+  trap "kill_listeners_on 7860 7862; kill $demo_pid 2>/dev/null || true" RETURN
+
+  local timeout=180
+  local start=$EPOCHSECONDS
+  local m4t_ok=0 expr_ok=0
+  while (( EPOCHSECONDS - start < timeout )); do
+    if ! kill -0 "$demo_pid" 2>/dev/null && (( m4t_ok == 0 || expr_ok == 0 )); then
+      echo "  FAIL: demo process exited before both ports came up. Tail of $log:"
+      tail -40 "$log" | sed 's/^/    /'
+      return 1
+    fi
+    if (( m4t_ok == 0 )); then
+      if curl -fsS -o /dev/null --max-time 2 http://127.0.0.1:7860/config 2>/dev/null; then
+        m4t_ok=1
+      fi
+    fi
+    if (( expr_ok == 0 )); then
+      if curl -fsS -o /dev/null --max-time 2 http://127.0.0.1:7862/config 2>/dev/null; then
+        expr_ok=1
+      fi
+    fi
+    if (( m4t_ok == 1 && expr_ok == 1 )); then
+      local elapsed=$((EPOCHSECONDS - start))
+      echo "  OK  M4T         http://127.0.0.1:7860/config  (200)"
+      echo "  OK  Expressive  http://127.0.0.1:7862/config  (200)"
+      echo "  ready in ${elapsed}s"
+      return 0
+    fi
+    sleep 2
+  done
+
+  echo "  FAIL: timed out after ${timeout}s.  m4t_ok=$m4t_ok  expr_ok=$expr_ok"
+  echo "  Tail of $log:"
+  tail -40 "$log" | sed 's/^/    /'
+  return 1
 }
 
 run_test_streaming() {
@@ -260,9 +343,9 @@ case "$MODE" in
     if [[ "$CHOICE" == "expressive" || "$CHOICE" == "both" ]]; then
       check_expressive_weights || exit $?
     fi
-    python "$WORKSPACE/runpod-seamless/demo/setup_checkpoints.py" || exit $?
+    python "$SCRIPT_DIR/demo/setup_checkpoints.py" || exit $?
 
-    LAUNCHER=$WORKSPACE/runpod-seamless/demo/launch_offline.sh
+    LAUNCHER=$SCRIPT_DIR/demo/launch_offline.sh
     LOG_DIR=$TEST_OUT/demo-logs
     mkdir -p "$LOG_DIR"
 
@@ -280,8 +363,12 @@ case "$MODE" in
       trap 'echo "[demo-offline] stopping m4t pid '"$M4T_PID"'"; kill '"$M4T_PID"' 2>/dev/null || true' EXIT INT TERM
       "$LAUNCHER" expressive
     else
-      port=7860; [[ "$CHOICE" == "expressive" ]] && port=7862
-      print_proxy_url "$port" "URL:"
+      if [[ "$CHOICE" == "expressive" ]]; then
+        port=7862; label="Expressive:"
+      else
+        port=7860; label="M4T:       "
+      fi
+      print_proxy_url "$port" "$label"
       echo
       exec "$LAUNCHER" "$CHOICE"
     fi
@@ -299,7 +386,7 @@ case "$MODE" in
     print_proxy_url 7860 "Streaming demo:"
     echo "(microphone access requires HTTPS — use the proxy URL, not raw 0.0.0.0)"
     echo
-    exec "$WORKSPACE/runpod-seamless/demo/launch_streaming.sh" "$CHOICE"
+    exec "$SCRIPT_DIR/demo/launch_streaming.sh" "$CHOICE"
     ;;
   claude)
     if ! command -v claude >/dev/null; then
@@ -318,12 +405,18 @@ case "$MODE" in
   test-streaming)
     run_test_streaming
     ;;
+  test-demo-offline)
+    run_test_demo_offline
+    ;;
   test-all)
     declare -A results
-    for t in m4t expressive streaming; do
+    # demo_offline is heavy (~150s — loads both apps into GPU + serves HTTP);
+    # ordered last so a fast-fail in the inference smokes surfaces first.
+    for t in m4t expressive streaming demo_offline; do
+      display=${t//_/-}
       echo
       echo "############################################"
-      echo "# test-$t"
+      echo "# test-$display"
       echo "############################################"
       if run_test_$t; then
         results[$t]=PASS
@@ -334,8 +427,9 @@ case "$MODE" in
     echo
     echo "=== test-all summary ==="
     fail=0
-    for t in m4t expressive streaming; do
-      printf "  %-12s %s\n" "$t" "${results[$t]}"
+    for t in m4t expressive streaming demo_offline; do
+      display=${t//_/-}
+      printf "  %-13s %s\n" "$display" "${results[$t]}"
       [[ "${results[$t]}" == "FAIL" ]] && fail=1
     done
     exit $fail
@@ -347,7 +441,7 @@ case "$MODE" in
     exec python "$@"
     ;;
   *)
-    echo "Usage: $0 {m4t|expressive|try|demo-offline|demo-streaming|claude|test-m4t|test-expressive|test-streaming|test-all|shell|python} [args...]"
+    echo "Usage: $0 {m4t|expressive|try|demo-offline|demo-streaming|claude|test-m4t|test-expressive|test-streaming|test-demo-offline|test-all|shell|python} [args...]"
     exit 1
     ;;
 esac
