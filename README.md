@@ -53,7 +53,7 @@ Pre-reqs:
 cd /workspace
 git clone https://github.com/TaviDev/runpod-seamless.git .scripts
 bash .scripts/install.sh         # ~25–35 min cold; ~22 GB gated weights + venv + React build
-/workspace/start.sh test-all     # smoke: m4t + expressive + streaming model-load
+/workspace/start.sh test-all     # smoke: m4t + expressive + streaming + demo-offline
 ```
 
 **With claude-code driving** (claude runs install.sh and reports back):
@@ -78,6 +78,12 @@ stop/start. Subsequent installs/redeploys don't need the env var.
 Add `7860` and `7862` as **HTTP Ports** in the pod UI (Edit Pod → HTTP
 Ports) so the demos are reachable through the RunPod HTTPS proxy at
 `https://${RUNPOD_POD_ID}-${PORT}.proxy.runpod.net/`.
+
+Use **HTTP Ports**, not TCP Ports. The HTTP proxy terminates TLS, returns a
+`https://…proxy.runpod.net/` URL (required for browser mic access), and
+forwards WebSocket upgrades — so the streaming demo's Socket.IO traffic
+goes through the same HTTP Port without a separate TCP entry. TCP Ports
+are raw forwarding (e.g. SSH on `22`); they're not what the demos need.
 
 Demo commands (after `test-all` passes):
 
@@ -126,10 +132,32 @@ Notes:
   `http://0.0.0.0:7860`.
 - The proxy is Cloudflare-fronted with a **100-second idle timeout**; long
   silences may drop the WebSocket. Browsers usually reconnect automatically.
+- WebSocket / Socket.IO traffic is forwarded by the HTTP proxy — no
+  separate TCP Port needed; the same `7860` HTTP Port handles both the
+  Vite/React asset serving and the Socket.IO upgrade.
 - `demo-streaming` and `demo-offline m4t` both use port 7860; run one at a
   time.
 - Background-noise denoising is not wired up yet — speak into a quiet mic for
   best results.
+
+### Smoke tests
+
+`test-all` covers all four layers; the demo-offline smoke runs last because
+it's heavy (~150 s cold). Standalone modes are useful when iterating on a
+single layer:
+
+```
+/workspace/start.sh test-m4t              # M4T v2 inference (S2TT eng→spa)
+/workspace/start.sh test-expressive       # SeamlessExpressive inference (S2ST eng→spa)
+/workspace/start.sh test-streaming        # streaming imports + asset URLs (no inference)
+/workspace/start.sh test-demo-offline     # launch demo-offline both, probe :7860 + :7862
+/workspace/start.sh test-all              # all four, summarized
+```
+
+`test-demo-offline` polls `/config` on each Gradio app with a 180 s
+timeout and tears the apps down via `kill_listeners_on` regardless of
+pass/fail, so it's safe to run while another demo isn't already on those
+ports.
 
 ### First-time setup
 
