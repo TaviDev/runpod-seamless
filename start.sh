@@ -6,7 +6,8 @@
 #   ./start.sh m4t <audio.wav> --task {ASR,S2ST,S2TT} --tgt_lang <lang> [...]
 #   ./start.sh expressive <audio.wav> --tgt_lang <lang> [...]
 #   ./start.sh try <audio.wav> [tgt_lang]    M4T S2TT + M4T S2ST + expressive S2ST, side-by-side
-#   ./start.sh streaming                 streaming server (TODO — see test-streaming for smoke test)
+#   ./start.sh demo-offline [m4t|expressive|both]   browser Gradio demos on :7860/:7862 (default both)
+#   ./start.sh demo-streaming [expressive|non-expressive]   real-time mic demo on :7860 (default expressive)
 #   ./start.sh claude                    Claude Code CLI with volume-backed config
 #   ./start.sh test-m4t                  smoke-test M4T v2 against reference WAV
 #   ./start.sh test-expressive           smoke-test SeamlessExpressive against reference WAV
@@ -34,6 +35,11 @@ mkdir -p "$FAIRSEQ2_CACHE_DIR"
 # SeamlessExpressive is HF-gated and NOT fetched by fairseq2 — it's
 # downloaded manually via `hf download` and passed via --gated-model-dir.
 EXPRESSIVE_MODEL_DIR=$WORKSPACE/models/hf-gated/seamless-expressive
+
+# Symlink farm consumed by the offline Gradio apps (both demos register assets
+# via InProcAssetMetadataProvider with file://$CHECKPOINTS_PATH/<basename> URIs).
+# Built/refreshed by demo/setup_checkpoints.py.
+export CHECKPOINTS_PATH=$WORKSPACE/models/checkpoints-demo
 
 # Volume-backed Claude Code config + npm global prefix. /etc/profile.d/seamless.sh
 # (dropped by install.sh) sets these for SSH sessions; we re-export here so
@@ -83,6 +89,66 @@ check_expressive_weights() {
       echo "ERROR: pretssel_melhifigan_wm-final.pt missing from $EXPRESSIVE_MODEL_DIR"
       return 1
     fi
+  fi
+}
+
+# install.sh Section 4 lists gradio + gradio_client (and we need omegaconf for
+# the expressive Gradio app), but its idempotency guard short-circuits the
+# whole section once seamless_communication is importable. On volumes where
+# Section 4 ran before those packages were added, we install them on demand.
+ensure_demo_deps() {
+  # Bumped to v2 after pinning starlette/fastapi/uvicorn — the earlier `pip
+  # install gradio~=4.5.0` pulled in starlette 1.0.0 + fastapi 0.136.1, which
+  # breaks gradio 4.5.0's templating (jinja2 cache key TypeError).
+  local marker=$WORKSPACE/models/.demo-deps-installed-v2
+  if [[ -f "$marker" ]] && python -c "import gradio, omegaconf, starlette, fastapi" 2>/dev/null; then
+    return 0
+  fi
+  echo "[ensure_demo_deps] installing gradio + omegaconf + pinned HTTP stack (one-time)..."
+  pip freeze > "$TEST_OUT/pip-freeze-pre-demo.txt"
+  # Pin starlette/fastapi/uvicorn to the gradio 4.5.0-era window. Without
+  # these, pip's resolver pulls in the latest, which breaks template render.
+  pip install --upgrade-strategy only-if-needed \
+    "gradio~=4.5.0" "gradio_client" "omegaconf~=2.3.0" "numpy<2" \
+    "starlette>=0.27,<0.40" "fastapi>=0.104,<0.110" "uvicorn>=0.23,<0.35"
+  python -c "
+import torch, gradio, omegaconf, starlette, fastapi
+assert torch.__version__.startswith('2.1.1'), f'torch drift: {torch.__version__}'
+print(f'  gradio={gradio.__version__}  starlette={starlette.__version__}  fastapi={fastapi.__version__}')
+" || {
+    echo "ERROR: post-install ABI check failed — see $TEST_OUT/pip-freeze-pre-demo.txt"
+    return 1
+  }
+  touch "$marker"
+}
+
+# The streaming HF Space's seamless_server expects models/Seamless/
+# pretssel_melhifigan_wm.pt relative to its own dir. Bridge that to our
+# canonical gated weights via a symlink. Idempotent.
+check_streaming_models() {
+  local server_dir=$WORKSPACE/seamless-streaming-demo/seamless_server
+  if [[ ! -d "$server_dir" ]]; then
+    echo "ERROR: streaming demo not cloned — expected $server_dir"
+    echo "  git clone https://huggingface.co/spaces/facebook/seamless-streaming \\"
+    echo "    $WORKSPACE/seamless-streaming-demo"
+    return 1
+  fi
+  check_expressive_weights || return $?
+  mkdir -p "$server_dir/models/Seamless"
+  if [[ ! -e "$server_dir/models/Seamless/pretssel_melhifigan_wm.pt" ]]; then
+    ln -sf "$EXPRESSIVE_MODEL_DIR/pretssel_melhifigan_wm.pt" \
+           "$server_dir/models/Seamless/pretssel_melhifigan_wm.pt"
+  fi
+}
+
+# Print the RunPod proxy URL for a given exposed port (best-effort).
+print_proxy_url() {
+  local port=$1
+  local label=$2
+  if [[ -n "${RUNPOD_POD_ID:-}" ]]; then
+    echo "  $label  https://${RUNPOD_POD_ID}-${port}.proxy.runpod.net/"
+  else
+    echo "  $label  http://0.0.0.0:${port}/   (set RUNPOD_POD_ID for proxy URL)"
   fi
 }
 
@@ -185,10 +251,55 @@ case "$MODE" in
     echo "  M4T:        $M4T_OUT"
     echo "  Expressive: $EXPR_OUT"
     ;;
-  streaming)
-    echo "streaming mode not yet wired up — coming in next phase"
-    echo "(for a stack smoke test, try: $0 test-streaming)"
-    exit 1
+  demo-offline)
+    CHOICE=${1:-both}
+    case "$CHOICE" in m4t|expressive|both) ;;
+      *) echo "Usage: $0 demo-offline [m4t|expressive|both]"; exit 1;;
+    esac
+    ensure_demo_deps || exit $?
+    if [[ "$CHOICE" == "expressive" || "$CHOICE" == "both" ]]; then
+      check_expressive_weights || exit $?
+    fi
+    python "$WORKSPACE/runpod-seamless/demo/setup_checkpoints.py" || exit $?
+
+    LAUNCHER=$WORKSPACE/runpod-seamless/demo/launch_offline.sh
+    LOG_DIR=$TEST_OUT/demo-logs
+    mkdir -p "$LOG_DIR"
+
+    echo
+    echo "=== demo-offline: $CHOICE ==="
+    if [[ "$CHOICE" == "both" ]]; then
+      print_proxy_url 7860 "M4T:       "
+      print_proxy_url 7862 "Expressive:"
+      echo "(both apps share the venv; first request to each pays a model-load cost)"
+      echo
+      nohup "$LAUNCHER" m4t > "$LOG_DIR/m4t.log" 2>&1 &
+      M4T_PID=$!
+      echo "[demo-offline] m4t backgrounded as pid $M4T_PID  (log: $LOG_DIR/m4t.log)"
+      # NOT `exec` — exec drops the trap, leaking the m4t background process on Ctrl-C.
+      trap 'echo "[demo-offline] stopping m4t pid '"$M4T_PID"'"; kill '"$M4T_PID"' 2>/dev/null || true' EXIT INT TERM
+      "$LAUNCHER" expressive
+    else
+      port=7860; [[ "$CHOICE" == "expressive" ]] && port=7862
+      print_proxy_url "$port" "URL:"
+      echo
+      exec "$LAUNCHER" "$CHOICE"
+    fi
+    ;;
+  demo-streaming)
+    CHOICE=${1:-expressive}
+    case "$CHOICE" in expressive|non-expressive) ;;
+      *) echo "Usage: $0 demo-streaming [expressive|non-expressive]"; exit 1;;
+    esac
+    ensure_demo_deps || exit $?
+    if [[ "$CHOICE" == "expressive" ]]; then
+      check_expressive_weights || exit $?
+    fi
+    check_streaming_models || exit $?
+    print_proxy_url 7860 "Streaming demo:"
+    echo "(microphone access requires HTTPS — use the proxy URL, not raw 0.0.0.0)"
+    echo
+    exec "$WORKSPACE/runpod-seamless/demo/launch_streaming.sh" "$CHOICE"
     ;;
   claude)
     if ! command -v claude >/dev/null; then
@@ -236,7 +347,7 @@ case "$MODE" in
     exec python "$@"
     ;;
   *)
-    echo "Usage: $0 {m4t|expressive|try|streaming|claude|test-m4t|test-expressive|test-streaming|test-all|shell|python} [args...]"
+    echo "Usage: $0 {m4t|expressive|try|demo-offline|demo-streaming|claude|test-m4t|test-expressive|test-streaming|test-all|shell|python} [args...]"
     exit 1
     ;;
 esac
