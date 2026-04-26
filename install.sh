@@ -42,6 +42,26 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
 log() { echo -e "\n\033[1;36m[install] $*\033[0m"; }
 
+# Pull RunPod template env vars (incl. "secrets") off PID 1 if they didn't
+# propagate down the launcher chain. RunPod injects template env onto the
+# container init, but tmux/ssh/relaunched-service parents can break the chain
+# so a child shell sees nothing. Allowlisted by name — never slurp wholesale,
+# that would clobber PATH/PWD/etc. Existing values in this shell win, so a
+# manual `export HF_TOKEN=…` still overrides the template.
+import_pod_env() {
+  [[ -r /proc/1/environ ]] || return 0
+  local kv name
+  while IFS= read -r -d '' kv; do
+    case "$kv" in
+      HF_TOKEN=*|HUGGING_FACE_HUB_TOKEN=*|HUGGINGFACE_HUB_TOKEN=*|\
+      WANDB_API_KEY=*|OPENAI_API_KEY=*|ANTHROPIC_API_KEY=*)
+        name=${kv%%=*}
+        [[ -z "${!name+x}" ]] && export "$kv"
+        ;;
+    esac
+  done < /proc/1/environ
+}
+
 # Prompt for HF_TOKEN up-front if unset and stdin is a tty. Empty input
 # (or non-interactive runs) fall through to the soft-skip in Section 6.
 prompt_hf_token_if_unset() {
@@ -369,6 +389,7 @@ publish_scripts() {
 }
 
 main() {
+  import_pod_env
   prompt_hf_token_if_unset
   create_dirs
   install_apt_deps
